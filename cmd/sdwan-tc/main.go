@@ -252,18 +252,47 @@ func detachIngress(iface string) error {
 	if err != nil {
 		return fmt.Errorf("list ingress filters: %w", err)
 	}
+	fmt.Printf("detach ingress iface=%s total_filters=%d\n", iface, len(filters))
+
+	totalBPF := 0
+	matched := 0
+	removed := 0
 	for _, f := range filters {
 		bpfFilter, ok := f.(*netlink.BpfFilter)
 		if !ok {
 			continue
 		}
+		totalBPF++
+		fmt.Printf(
+			"found bpf program name=%q fd=%d handle=%d priority=%d protocol=%d\n",
+			bpfFilter.Name,
+			bpfFilter.Fd,
+			bpfFilter.Attrs().Handle,
+			bpfFilter.Attrs().Priority,
+			bpfFilter.Attrs().Protocol,
+		)
 		if bpfFilter.Name != programName {
 			continue
 		}
+		matched++
 		if err := netlink.FilterDel(f); err != nil {
 			return fmt.Errorf("delete ingress filter: %w", err)
 		}
+		removed++
+		fmt.Printf(
+			"removed bpf program name=%q handle=%d priority=%d\n",
+			bpfFilter.Name,
+			bpfFilter.Attrs().Handle,
+			bpfFilter.Attrs().Priority,
+		)
 	}
+	fmt.Printf(
+		"detach summary iface=%s bpf_seen=%d matched=%d removed=%d\n",
+		iface,
+		totalBPF,
+		matched,
+		removed,
+	)
 	return nil
 }
 
