@@ -8,7 +8,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 
@@ -18,22 +17,16 @@ import (
 )
 
 const (
-	programIngressName = "tc_mark_delegate_ingress"
-	programEgressName  = "tc_mark_delegate_egress"
-	legacyProgramName  = "tc_mark_delegate"
-	cfgMap             = "cfg"
-	statsMap           = "stats"
+	programName = "tc_mark_delegate"
+	cfgMap      = "cfg"
+	statsMap    = "stats"
 
 	defaultMark = uint32(0x66)
 	defaultPin  = "/sys/fs/bpf/ebpf-sd-wan"
 )
 
 type cfgValue struct {
-	Mark        uint32
-	DNSRedirect uint32
-	DNSIPBE     uint32
-	DNSPortBE   uint16
-	Pad         uint16
+	Mark uint32
 }
 
 type statsValue struct {
@@ -71,9 +64,6 @@ func runApply(args []string) error {
 	iface := fs.String("iface", "", "interface name (required)")
 	obj := fs.String("obj", "./bpf/mark_delegate.o", "path to eBPF object")
 	mark := fs.Uint("mark", uint(defaultMark), "skb mark (decimal or 0xhex)")
-	dnsRedirect := fs.Bool("dns-redirect", false, "force redirect IPv4 TCP/UDP dport 53")
-	dnsIP := fs.String("dns-ip", "10.66.67.1", "DNS redirect target IPv4")
-	dnsPort := fs.Uint("dns-port", 53, "DNS redirect target port")
 	pin := fs.String("pin", defaultPin, "bpffs pin directory")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -92,45 +82,25 @@ func runApply(args []string) error {
 	}
 	defer coll.Close()
 
-	ingressProg, ok := coll.Programs[programIngressName]
+	prog, ok := coll.Programs[programName]
 	if !ok {
-		return fmt.Errorf("program %q not found in object", programIngressName)
-	}
-	egressProg, ok := coll.Programs[programEgressName]
-	if !ok {
-		return fmt.Errorf("program %q not found in object", programEgressName)
+		return fmt.Errorf("program %q not found in object", programName)
 	}
 	if err := ensureClsact(*iface); err != nil {
 		return err
 	}
-	if err := attachTC(*iface, ingressProg.FD(), programIngressName, netlink.HANDLE_MIN_INGRESS, 1); err != nil {
-		return err
-	}
-	if err := attachTC(*iface, egressProg.FD(), programEgressName, netlink.HANDLE_MIN_EGRESS, 1); err != nil {
+	if err := attachTC(*iface, prog.FD(), programName, netlink.HANDLE_MIN_INGRESS, 1); err != nil {
 		return err
 	}
 
-	cfg, err := buildCfg(uint32(*mark), *dnsRedirect, *dnsIP, uint16(*dnsPort))
-	if err != nil {
-		return err
-	}
-
-	if err := programMaps(coll, cfg); err != nil {
+	if err := programMaps(coll, uint32(*mark)); err != nil {
 		return err
 	}
 	if err := pinMaps(coll, *pin); err != nil {
 		return err
 	}
 
-	fmt.Printf(
-		"applied on iface=%s mark=0x%x dns_redirect=%t dns_target=%s:%d pin=%s\n",
-		*iface,
-		*mark,
-		*dnsRedirect,
-		*dnsIP,
-		*dnsPort,
-		*pin,
-	)
+	fmt.Printf("applied on iface=%s mark=0x%x pin=%s\n", *iface, *mark, *pin)
 	return nil
 }
 
@@ -187,7 +157,7 @@ func runStats(args []string) error {
 	return enc.Encode(rows)
 }
 
-func programMaps(coll *ebpf.Collection, cfgVal cfgValue) error {
+func programMaps(coll *ebpf.Collection, mark uint32) error {
 	cmap, ok := coll.Maps[cfgMap]
 	if !ok {
 		return fmt.Errorf("map %q not found", cfgMap)
@@ -198,6 +168,7 @@ func programMaps(coll *ebpf.Collection, cfgVal cfgValue) error {
 	}
 
 	cfgKey := uint32(0)
+	cfgVal := cfgValue{Mark: mark}
 	if err := cmap.Update(cfgKey, cfgVal, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update cfg map: %w", err)
 	}
@@ -207,26 +178,6 @@ func programMaps(coll *ebpf.Collection, cfgVal cfgValue) error {
 		return fmt.Errorf("initialize stats map: %w", err)
 	}
 	return nil
-}
-
-func buildCfg(mark uint32, dnsRedirect bool, dnsIP string, dnsPort uint16) (cfgValue, error) {
-	cfg := cfgValue{
-		Mark: mark,
-	}
-	if dnsPort == 0 {
-		return cfg, fmt.Errorf("dns-port must be > 0")
-	}
-	if !dnsRedirect {
-		return cfg, nil
-	}
-	ip := net.ParseIP(dnsIP).To4()
-	if ip == nil {
-		return cfg, fmt.Errorf("invalid IPv4 dns-ip: %q", dnsIP)
-	}
-	cfg.DNSRedirect = 1
-	cfg.DNSIPBE = uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
-	cfg.DNSPortBE = uint16(dnsPort<<8) | uint16(dnsPort>>8)
-	return cfg, nil
 }
 
 func pinMaps(coll *ebpf.Collection, pinDir string) error {
@@ -299,60 +250,31 @@ func detachTC(iface string) error {
 
 	parents := []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS}
 	matchNames := map[string]struct{}{
-		programIngressName: {},
-		programEgressName:  {},
-		legacyProgramName:  {},
+		"tc_mark_delegate":         {},
+		"tc_mark_delegate_ingress": {},
+		"tc_mark_delegate_egress":  {},
+		"tc_dns_hijack_ingress":    {},
+		"tc_dns_hijack_egress":     {},
 	}
 
-	totalBPF := 0
-	matched := 0
-	removed := 0
 	for _, parent := range parents {
 		filters, err := netlink.FilterList(link, parent)
 		if err != nil {
 			return fmt.Errorf("list filters parent=0x%x: %w", parent, err)
 		}
-		fmt.Printf("detach tc iface=%s parent=0x%x total_filters=%d\n", iface, parent, len(filters))
-
 		for _, f := range filters {
 			bpfFilter, ok := f.(*netlink.BpfFilter)
 			if !ok {
 				continue
 			}
-			totalBPF++
-			fmt.Printf(
-				"found bpf program name=%q fd=%d handle=%d priority=%d protocol=%d parent=0x%x\n",
-				bpfFilter.Name,
-				bpfFilter.Fd,
-				bpfFilter.Attrs().Handle,
-				bpfFilter.Attrs().Priority,
-				bpfFilter.Attrs().Protocol,
-				parent,
-			)
 			if _, ok := matchNames[bpfFilter.Name]; !ok {
 				continue
 			}
-			matched++
 			if err := netlink.FilterDel(f); err != nil {
 				return fmt.Errorf("delete tc filter parent=0x%x: %w", parent, err)
 			}
-			removed++
-			fmt.Printf(
-				"removed bpf program name=%q handle=%d priority=%d parent=0x%x\n",
-				bpfFilter.Name,
-				bpfFilter.Attrs().Handle,
-				bpfFilter.Attrs().Priority,
-				parent,
-			)
 		}
 	}
-	fmt.Printf(
-		"detach summary iface=%s bpf_seen=%d matched=%d removed=%d\n",
-		iface,
-		totalBPF,
-		matched,
-		removed,
-	)
 	return nil
 }
 
@@ -365,7 +287,7 @@ func usage() {
 	fmt.Println(`sdwan-tc
 
 Usage:
-  sdwan-tc apply  --iface <ifname> [--obj ./bpf/mark_delegate.o] [--mark 0x66] [--dns-redirect --dns-ip 10.66.67.1 --dns-port 53] [--pin /sys/fs/bpf/ebpf-sd-wan]
+  sdwan-tc apply  --iface <ifname> [--obj ./bpf/mark_delegate.o] [--mark 0x66] [--pin /sys/fs/bpf/ebpf-sd-wan]
   sdwan-tc detach --iface <ifname>
   sdwan-tc stats  [--pin /sys/fs/bpf/ebpf-sd-wan]
 `)
