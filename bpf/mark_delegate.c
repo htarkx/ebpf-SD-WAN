@@ -5,6 +5,7 @@
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include <linux/in.h>
 
 struct cfg_val {
 	__u32 mark;
