@@ -25,6 +25,8 @@ struct flow_key {
 	__u16 client_port_be;
 	__u8 proto;
 	__u8 _pad;
+	__u16 dns_id_be;
+	__u16 _pad2;
 };
 
 struct flow_val {
@@ -74,8 +76,10 @@ static __always_inline int maybe_redirect_dns(struct __sk_buff *skb, struct cfg_
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *iph = data;
 	__u32 l4_off;
+	__u32 payload_off;
 	__u16 old_sport, old_dport, old_check = 0;
 	__u32 old_daddr;
+	__u16 dns_id_be = 0;
 	__u8 proto;
 	int is_udp;
 	struct flow_key fkey = {};
@@ -105,6 +109,8 @@ static __always_inline int maybe_redirect_dns(struct __sk_buff *skb, struct cfg_
 		return 0;
 	if (old_dport != bpf_htons(53))
 		return 0;
+	if (iph->daddr == cfg_val->dns_ip_be && old_dport == cfg_val->dns_port_be)
+		return 0;
 
 	old_daddr = iph->daddr;
 	is_udp = (proto == IPPROTO_UDP);
@@ -112,9 +118,31 @@ static __always_inline int maybe_redirect_dns(struct __sk_buff *skb, struct cfg_
 	    bpf_skb_load_bytes(skb, l4_off + offsetof(struct udphdr, check), &old_check, sizeof(old_check)) < 0)
 		return 0;
 
+	if (is_udp) {
+		payload_off = l4_off + sizeof(struct udphdr);
+		if (data + payload_off + 2 > data_end)
+			return 0;
+		if (bpf_skb_load_bytes(skb, payload_off, &dns_id_be, sizeof(dns_id_be)) < 0)
+			return 0;
+	} else {
+		struct tcphdr th;
+
+		if (bpf_skb_load_bytes(skb, l4_off, &th, sizeof(th)) < 0)
+			return 0;
+		payload_off = l4_off + ((__u32)th.doff * 4);
+		if (payload_off < l4_off + sizeof(struct tcphdr))
+			return 0;
+		/* DNS over TCP prepends 2-byte length before DNS header */
+		if (data + payload_off + 4 > data_end)
+			return 0;
+		if (bpf_skb_load_bytes(skb, payload_off + 2, &dns_id_be, sizeof(dns_id_be)) < 0)
+			return 0;
+	}
+
 	fkey.client_ip_be = iph->saddr;
 	fkey.client_port_be = old_sport;
 	fkey.proto = proto;
+	fkey.dns_id_be = dns_id_be;
 	fval.orig_dns_ip_be = old_daddr;
 	fval.orig_dns_port_be = old_dport;
 	bpf_map_update_elem(&dns_flows, &fkey, &fval, BPF_ANY);
@@ -146,8 +174,10 @@ static __always_inline int maybe_restore_dns(struct __sk_buff *skb, struct cfg_v
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *iph = data;
 	__u32 l4_off;
+	__u32 payload_off;
 	__u16 old_sport, old_dport, old_check = 0;
 	__u32 old_saddr;
+	__u16 dns_id_be = 0;
 	__u8 proto;
 	int is_udp;
 	struct flow_key fkey = {};
@@ -184,9 +214,30 @@ static __always_inline int maybe_restore_dns(struct __sk_buff *skb, struct cfg_v
 	    bpf_skb_load_bytes(skb, l4_off + offsetof(struct udphdr, check), &old_check, sizeof(old_check)) < 0)
 		return 0;
 
+	if (is_udp) {
+		payload_off = l4_off + sizeof(struct udphdr);
+		if (data + payload_off + 2 > data_end)
+			return 0;
+		if (bpf_skb_load_bytes(skb, payload_off, &dns_id_be, sizeof(dns_id_be)) < 0)
+			return 0;
+	} else {
+		struct tcphdr th;
+
+		if (bpf_skb_load_bytes(skb, l4_off, &th, sizeof(th)) < 0)
+			return 0;
+		payload_off = l4_off + ((__u32)th.doff * 4);
+		if (payload_off < l4_off + sizeof(struct tcphdr))
+			return 0;
+		if (data + payload_off + 4 > data_end)
+			return 0;
+		if (bpf_skb_load_bytes(skb, payload_off + 2, &dns_id_be, sizeof(dns_id_be)) < 0)
+			return 0;
+	}
+
 	fkey.client_ip_be = iph->daddr;
 	fkey.client_port_be = old_dport;
 	fkey.proto = proto;
+	fkey.dns_id_be = dns_id_be;
 	fval = bpf_map_lookup_elem(&dns_flows, &fkey);
 	if (!fval)
 		return 0;
@@ -208,6 +259,7 @@ static __always_inline int maybe_restore_dns(struct __sk_buff *skb, struct cfg_v
 		if (bpf_l4_csum_replace(skb, csum_off, old_sport, fval->orig_dns_port_be, sizeof(fval->orig_dns_port_be)) < 0)
 			return 0;
 	}
+	bpf_map_delete_elem(&dns_flows, &fkey);
 
 	return 0;
 }
