@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -26,7 +27,11 @@ const (
 )
 
 type cfgValue struct {
-	Mark uint32
+	Mark        uint32
+	DNSRedirect uint32
+	DNSIPBE     uint32
+	DNSPortBE   uint16
+	Pad         uint16
 }
 
 type statsValue struct {
@@ -64,6 +69,9 @@ func runApply(args []string) error {
 	iface := fs.String("iface", "", "interface name (required)")
 	obj := fs.String("obj", "./bpf/mark_delegate.o", "path to eBPF object")
 	mark := fs.Uint("mark", uint(defaultMark), "skb mark (decimal or 0xhex)")
+	dnsRedirect := fs.Bool("dns-redirect", false, "force redirect IPv4 TCP/UDP dport 53")
+	dnsIP := fs.String("dns-ip", "10.66.67.1", "DNS redirect target IPv4")
+	dnsPort := fs.Uint("dns-port", 53, "DNS redirect target port")
 	pin := fs.String("pin", defaultPin, "bpffs pin directory")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -93,14 +101,27 @@ func runApply(args []string) error {
 		return err
 	}
 
-	if err := programMaps(coll, uint32(*mark)); err != nil {
+	cfg, err := buildCfg(uint32(*mark), *dnsRedirect, *dnsIP, uint16(*dnsPort))
+	if err != nil {
+		return err
+	}
+
+	if err := programMaps(coll, cfg); err != nil {
 		return err
 	}
 	if err := pinMaps(coll, *pin); err != nil {
 		return err
 	}
 
-	fmt.Printf("applied on iface=%s mark=0x%x pin=%s\n", *iface, *mark, *pin)
+	fmt.Printf(
+		"applied on iface=%s mark=0x%x dns_redirect=%t dns_target=%s:%d pin=%s\n",
+		*iface,
+		*mark,
+		*dnsRedirect,
+		*dnsIP,
+		*dnsPort,
+		*pin,
+	)
 	return nil
 }
 
@@ -157,7 +178,7 @@ func runStats(args []string) error {
 	return enc.Encode(rows)
 }
 
-func programMaps(coll *ebpf.Collection, mark uint32) error {
+func programMaps(coll *ebpf.Collection, cfgVal cfgValue) error {
 	cmap, ok := coll.Maps[cfgMap]
 	if !ok {
 		return fmt.Errorf("map %q not found", cfgMap)
@@ -168,7 +189,6 @@ func programMaps(coll *ebpf.Collection, mark uint32) error {
 	}
 
 	cfgKey := uint32(0)
-	cfgVal := cfgValue{Mark: mark}
 	if err := cmap.Update(cfgKey, cfgVal, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update cfg map: %w", err)
 	}
@@ -178,6 +198,26 @@ func programMaps(coll *ebpf.Collection, mark uint32) error {
 		return fmt.Errorf("initialize stats map: %w", err)
 	}
 	return nil
+}
+
+func buildCfg(mark uint32, dnsRedirect bool, dnsIP string, dnsPort uint16) (cfgValue, error) {
+	cfg := cfgValue{
+		Mark: mark,
+	}
+	if dnsPort == 0 {
+		return cfg, fmt.Errorf("dns-port must be > 0")
+	}
+	if !dnsRedirect {
+		return cfg, nil
+	}
+	ip := net.ParseIP(dnsIP).To4()
+	if ip == nil {
+		return cfg, fmt.Errorf("invalid IPv4 dns-ip: %q", dnsIP)
+	}
+	cfg.DNSRedirect = 1
+	cfg.DNSIPBE = uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+	cfg.DNSPortBE = uint16(dnsPort<<8) | uint16(dnsPort>>8)
+	return cfg, nil
 }
 
 func pinMaps(coll *ebpf.Collection, pinDir string) error {
@@ -305,7 +345,7 @@ func usage() {
 	fmt.Println(`sdwan-tc
 
 Usage:
-  sdwan-tc apply  --iface <ifname> [--obj ./bpf/mark_delegate.o] [--mark 0x66] [--pin /sys/fs/bpf/ebpf-sd-wan]
+  sdwan-tc apply  --iface <ifname> [--obj ./bpf/mark_delegate.o] [--mark 0x66] [--dns-redirect --dns-ip 10.66.67.1 --dns-port 53] [--pin /sys/fs/bpf/ebpf-sd-wan]
   sdwan-tc detach --iface <ifname>
   sdwan-tc stats  [--pin /sys/fs/bpf/ebpf-sd-wan]
 `)
