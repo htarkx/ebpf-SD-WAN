@@ -18,9 +18,11 @@ import (
 )
 
 const (
-	programName = "tc_mark_delegate"
-	cfgMap      = "cfg"
-	statsMap    = "stats"
+	programIngressName = "tc_mark_delegate_ingress"
+	programEgressName  = "tc_mark_delegate_egress"
+	legacyProgramName  = "tc_mark_delegate"
+	cfgMap             = "cfg"
+	statsMap           = "stats"
 
 	defaultMark = uint32(0x66)
 	defaultPin  = "/sys/fs/bpf/ebpf-sd-wan"
@@ -90,14 +92,21 @@ func runApply(args []string) error {
 	}
 	defer coll.Close()
 
-	prog, ok := coll.Programs[programName]
+	ingressProg, ok := coll.Programs[programIngressName]
 	if !ok {
-		return fmt.Errorf("program %q not found in object", programName)
+		return fmt.Errorf("program %q not found in object", programIngressName)
+	}
+	egressProg, ok := coll.Programs[programEgressName]
+	if !ok {
+		return fmt.Errorf("program %q not found in object", programEgressName)
 	}
 	if err := ensureClsact(*iface); err != nil {
 		return err
 	}
-	if err := attachIngress(*iface, prog.FD(), programName); err != nil {
+	if err := attachTC(*iface, ingressProg.FD(), programIngressName, netlink.HANDLE_MIN_INGRESS, 1); err != nil {
+		return err
+	}
+	if err := attachTC(*iface, egressProg.FD(), programEgressName, netlink.HANDLE_MIN_EGRESS, 1); err != nil {
 		return err
 	}
 
@@ -134,10 +143,10 @@ func runDetach(args []string) error {
 	if *iface == "" {
 		return errors.New("detach requires --iface")
 	}
-	if err := detachIngress(*iface); err != nil {
+	if err := detachTC(*iface); err != nil {
 		return err
 	}
-	fmt.Printf("detached ingress filter on iface=%s\n", *iface)
+	fmt.Printf("detached tc filters on iface=%s\n", *iface)
 	return nil
 }
 
@@ -258,7 +267,7 @@ func ensureClsact(iface string) error {
 	return nil
 }
 
-func attachIngress(iface string, progFD int, name string) error {
+func attachTC(iface string, progFD int, name string, parent uint32, handle uint32) error {
 	link, err := netlink.LinkByName(iface)
 	if err != nil {
 		return fmt.Errorf("lookup iface %q: %w", iface, err)
@@ -267,8 +276,8 @@ func attachIngress(iface string, progFD int, name string) error {
 	filter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    1,
+			Parent:    parent,
+			Handle:    handle,
 			Priority:  1,
 			Protocol:  unix.ETH_P_ALL,
 		},
@@ -277,54 +286,65 @@ func attachIngress(iface string, progFD int, name string) error {
 		DirectAction: true,
 	}
 	if err := netlink.FilterReplace(filter); err != nil {
-		return fmt.Errorf("attach ingress filter: %w", err)
+		return fmt.Errorf("attach tc filter parent=0x%x: %w", parent, err)
 	}
 	return nil
 }
 
-func detachIngress(iface string) error {
+func detachTC(iface string) error {
 	link, err := netlink.LinkByName(iface)
 	if err != nil {
 		return fmt.Errorf("lookup iface %q: %w", iface, err)
 	}
 
-	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
-	if err != nil {
-		return fmt.Errorf("list ingress filters: %w", err)
+	parents := []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS}
+	matchNames := map[string]struct{}{
+		programIngressName: {},
+		programEgressName:  {},
+		legacyProgramName:  {},
 	}
-	fmt.Printf("detach ingress iface=%s total_filters=%d\n", iface, len(filters))
 
 	totalBPF := 0
 	matched := 0
 	removed := 0
-	for _, f := range filters {
-		bpfFilter, ok := f.(*netlink.BpfFilter)
-		if !ok {
-			continue
+	for _, parent := range parents {
+		filters, err := netlink.FilterList(link, parent)
+		if err != nil {
+			return fmt.Errorf("list filters parent=0x%x: %w", parent, err)
 		}
-		totalBPF++
-		fmt.Printf(
-			"found bpf program name=%q fd=%d handle=%d priority=%d protocol=%d\n",
-			bpfFilter.Name,
-			bpfFilter.Fd,
-			bpfFilter.Attrs().Handle,
-			bpfFilter.Attrs().Priority,
-			bpfFilter.Attrs().Protocol,
-		)
-		if bpfFilter.Name != programName {
-			continue
+		fmt.Printf("detach tc iface=%s parent=0x%x total_filters=%d\n", iface, parent, len(filters))
+
+		for _, f := range filters {
+			bpfFilter, ok := f.(*netlink.BpfFilter)
+			if !ok {
+				continue
+			}
+			totalBPF++
+			fmt.Printf(
+				"found bpf program name=%q fd=%d handle=%d priority=%d protocol=%d parent=0x%x\n",
+				bpfFilter.Name,
+				bpfFilter.Fd,
+				bpfFilter.Attrs().Handle,
+				bpfFilter.Attrs().Priority,
+				bpfFilter.Attrs().Protocol,
+				parent,
+			)
+			if _, ok := matchNames[bpfFilter.Name]; !ok {
+				continue
+			}
+			matched++
+			if err := netlink.FilterDel(f); err != nil {
+				return fmt.Errorf("delete tc filter parent=0x%x: %w", parent, err)
+			}
+			removed++
+			fmt.Printf(
+				"removed bpf program name=%q handle=%d priority=%d parent=0x%x\n",
+				bpfFilter.Name,
+				bpfFilter.Attrs().Handle,
+				bpfFilter.Attrs().Priority,
+				parent,
+			)
 		}
-		matched++
-		if err := netlink.FilterDel(f); err != nil {
-			return fmt.Errorf("delete ingress filter: %w", err)
-		}
-		removed++
-		fmt.Printf(
-			"removed bpf program name=%q handle=%d priority=%d\n",
-			bpfFilter.Name,
-			bpfFilter.Attrs().Handle,
-			bpfFilter.Attrs().Priority,
-		)
 	}
 	fmt.Printf(
 		"detach summary iface=%s bpf_seen=%d matched=%d removed=%d\n",
